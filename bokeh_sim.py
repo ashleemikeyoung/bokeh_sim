@@ -52,7 +52,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-__version__ = "0.1.0"
+__version__ = "0.2.0-dev"
 LENSES = {"summicron": 2.0, "summilux": 1.4, "noctilux": 0.95}
 SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0}
 GRAIN_SIGMA = 0.3  # fineness of synthetic grain, matched to Fuji X-series JPEG grain
@@ -314,11 +314,13 @@ def line_response(L, angles=12, sx=5.0, sy=0.9, side=2.8):
     return np.maximum(best, 0)
 
 
-def fine_detail_mask(srgb, disp, d_focus, zone, reach=0.14):
+def find_whiskers(srgb, disp, d_focus, zone, reach=0.06):
     """
     Depth maps cannot see whiskers (1-3 px wide), so they get blurred away as background.
-    Find crisp thin lines in the original and return how strongly to restore them (0..1),
-    fading out with distance from the in-focus subject.
+    Anything inside the in-focus zone stays sharp on its own, so only thin lines that run
+    OUTSIDE that zone need protecting. A line qualifies if it is long, thin, has a clearly
+    strong core (strong pixels pull in weaker connected ones, keeping it whole) and is
+    attached to the in-focus subject. Returns a uint8 mask (1 = whisker pixel).
     """
     h, w = disp.shape
     long_side = max(h, w)
@@ -332,14 +334,35 @@ def fine_detail_mask(srgb, disp, d_focus, zone, reach=0.14):
     thr = float(np.percentile(line_response(0.5 + amp * u / max(_noise_level(u), 1e-8)), 99.7))
 
     R = line_response(L)
-    a = np.clip((R - thr) / max(thr, 1e-6), 0, 1)
-    a = cv2.GaussianBlur(cv2.dilate(a, np.ones((3, 3), np.uint8)), (0, 0), 0.7)
+    near = np.abs(disp - d_focus) <= zone
+    cand = ((R > thr) & ~near).astype(np.uint8)          # line pixels outside the sharp zone
+    strong = (R > 1.4 * thr) & ~near
 
-    # only near the in-focus subject
-    near = (np.abs(disp - d_focus) <= zone).astype(np.uint8)
-    dist = cv2.distanceTransform(1 - near, cv2.DIST_L2, 5)
-    gate = np.clip((1 - dist / (reach * long_side)) * 1.6, 0, 1)  # full strength for the first third, then fade
-    return (a * gate).astype(np.float32)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    has_strong = np.zeros(n, bool)
+    has_strong[np.unique(lab[strong])] = True
+    length = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+    area = stats[:, cv2.CC_STAT_AREA]
+
+    dist = cv2.distanceTransform((~near).astype(np.uint8), cv2.DIST_L2, 5)
+    seg_dist = np.full(n, np.inf)
+    np.minimum.at(seg_dist, lab[cand > 0], dist[cand > 0])
+
+    ok = (has_strong & (length >= 0.008 * long_side)      # long enough
+          & (area / np.maximum(length, 1) <= 22)          # and thin (not a fur patch)
+          & (seg_dist <= reach * long_side))              # attached to the subject
+    ok[0] = False
+
+    mask = (ok[lab] & (cand > 0)).astype(np.uint8)
+    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+
+def remove_thin_lines(lin, srgb, mask):
+    """Fill whisker pixels with their surrounding background (so blur has nothing to smear)."""
+    bgr8 = np.ascontiguousarray((srgb[..., ::-1] * 255 + 0.5).astype(np.uint8))
+    filled = cv2.inpaint(bgr8, mask, 3, cv2.INPAINT_TELEA)
+    filled_lin = srgb_to_lin(filled[..., ::-1].astype(np.float32) / 255.0)
+    return np.where(mask[..., None] > 0, filled_lin, lin).astype(np.float32)
 
 
 # --------------------------------------------------------------------------
@@ -400,7 +423,7 @@ def main():
     ap.add_argument("--grain", type=float, default=1.0,
                     help="re-add sensor grain to blurred areas to match the original (0 = off)")
     ap.add_argument("--detail", type=float, default=1.0,
-                    help="keep whiskers and other hair-thin detail sharp near the subject (0 = off)")
+                    help="keep whiskers sharp: remove, blur, then add back (0 = off, 1 = full)")
     ap.add_argument("--no-refine", action="store_true", help="skip depth edge refinement")
     ap.add_argument("--out-dir", default=None, help="default: next to the input file")
     ap.add_argument("--strength", type=float, default=0.04,
@@ -479,12 +502,16 @@ def main():
             d_focus = auto_focus(rgb8, disp)
             print(f"No face found, focus plane (auto): {d_focus:.3f}")
 
-    keep = None
+    lin = srgb_to_lin(srgb).astype(np.float32)
+    base = lin          # image that gets blurred
+    soft = None         # where whiskers are added back
     if args.detail > 0:
         print("Finding whiskers and fine detail...")
-        keep = np.clip(fine_detail_mask(srgb, disp, d_focus, args.focus_zone) * args.detail, 0, 1)
-
-    lin = srgb_to_lin(srgb).astype(np.float32)
+        whisk = find_whiskers(srgb, disp, d_focus, args.focus_zone)
+        print(f"  {int(whisk.sum())} whisker pixels found")
+        if whisk.any():
+            base = remove_thin_lines(lin, srgb, whisk)
+            soft = np.clip(cv2.GaussianBlur(whisk.astype(np.float32), (0, 0), 0.7) * args.detail, 0, 1)
     k_px = args.strength * long_side
     max_r = 0.06 * long_side
 
@@ -494,10 +521,10 @@ def main():
             print(f"Skipping {name} f/{n:g}: the photo is already at or beyond that look.")
             continue
         print(f"Rendering {name} f/{n:g} ...")
-        out_lin, r_map = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r, args.focus_zone)
-        if keep is not None:
-            out_lin = out_lin * (1 - keep[..., None]) + lin * keep[..., None]
-            r_map = r_map * (1 - keep)
+        out_lin, r_map = render(base, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r, args.focus_zone)
+        if soft is not None:  # whiskers go back on as a thin detail layer (original minus filled background)
+            out_lin = np.maximum(out_lin + (lin - base) * soft[..., None], 0)
+            r_map = r_map * (1 - soft)
         out_srgb = lin_to_srgb(out_lin)
         if args.grain > 0:
             out_srgb = add_grain(out_srgb, srgb, r_map, args.grain)
