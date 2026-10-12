@@ -17,29 +17,29 @@
 """
 bokeh_sim.py
 
-Re-render a finished photo (shot at f/2 or f/2.8) as it would look on a
-full-frame Summicron f/2, Summilux f/1.4 and Noctilux f/0.95, using
-Depth Anything V2 for depth. No manual masking.
+Re-render a finished photo as it would look with a Summicron f/2, Summilux f/1.4
+or Noctilux f/0.95, using Depth Anything V2 for depth. No manual masking.
 
 Usage:
-    python bokeh_sim.py photo.jpg                       # APS-C, shot at f/2
-    python bokeh_sim.py photo.jpg --sensor m43 --source-f 2.8
-    python bokeh_sim.py photo.jpg --sensor ff --lenses summilux
-    python bokeh_sim.py photo.jpg --focus 0.50,0.24     # pin focus (fractions of width,height)
+    python bokeh_sim.py photo.jpg                          # same system as the photo
+    python bokeh_sim.py photo.jpg --lenses noctilux
+    python bokeh_sim.py photo.jpg --target-sensor ff       # restyle as if shot on full frame
+    python bokeh_sim.py photo.jpg --sensor m43 --source-f 5 --focal-length 75   # no EXIF
+    python bokeh_sim.py photo.jpg --focus 0.50,0.24        # pin focus (fractions of width,height)
 
-Sensor equivalence:
-    Depth of field depends on sensor size, so the photo's existing blur is
-    treated as that of a full-frame lens at (source f-number x crop factor):
-    APS-C 1.5x, M43 2x, FF 1x. Only the extra blur needed to reach each
-    target aperture is added (blurs combine in quadrature). A look the photo
+Same system vs another sensor:
+    By default the look stays on the photo's own sensor: an M43 f/5 photo becomes
+    M43 f/2, f/1.4 or f/0.95. --target-sensor ff|apsc|m43|mf (or --target-crop) instead
+    asks "what if this had been shot on that sensor at that aperture?", which compares
+    them on a full-frame-equivalent basis (f-number x crop factor). A look the photo
     already meets or exceeds is skipped, since blur cannot be removed.
-    Assumes the full-frame version is framed identically (e.g. 23mm APS-C
-    versus 35mm FF at the same distance).
+    Assumes the same framing (e.g. 23mm APS-C versus 35mm FF at the same distance).
 
 How the blur works:
     Layered disc blur by depth, premultiplied so the sharp subject does not
     bleed into the background, composited back to front in linear light with
-    optional highlight bloom for bokeh discs.
+    optional highlight bloom for bokeh discs. Only the extra blur needed is added
+    (blurs combine in quadrature).
 """
 import os
 
@@ -53,7 +53,7 @@ import numpy as np
 from PIL import Image
 
 LENSES = {"summicron": 2.0, "summilux": 1.4, "noctilux": 0.95}
-SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0}
+SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0, "mf": 0.79}  # mf = 44x33 medium format (GFX, X2D)
 
 
 # --------------------------------------------------------------------------
@@ -223,6 +223,10 @@ def main():
     ap.add_argument("--sensor", choices=list(SENSOR_CROP), default=None,
                     help="sensor type (default: worked out from EXIF)")
     ap.add_argument("--crop", type=float, default=None, help="custom crop factor, overrides --sensor")
+    ap.add_argument("--target-sensor", choices=["same"] + list(SENSOR_CROP), default="same",
+                    help="sensor the look is rendered for (default: same system as the photo)")
+    ap.add_argument("--target-crop", type=float, default=None,
+                    help="custom target crop factor, overrides --target-sensor")
     ap.add_argument("--lenses", nargs="+", choices=list(LENSES), default=list(LENSES))
     ap.add_argument("--focus", default=None, help="focus point as fractions, e.g. 0.50,0.24")
     ap.add_argument("--out-dir", default=None, help="default: next to the input file")
@@ -265,6 +269,12 @@ def main():
         raise SystemExit("No EXIF found, please provide: " + " and ".join(missing))
 
     n_eff = f_number * crop
+    if args.target_crop:
+        crop_t, tgt_label = args.target_crop, f"{args.target_crop:g}x crop"
+    elif args.target_sensor != "same":
+        crop_t, tgt_label = SENSOR_CROP[args.target_sensor], args.target_sensor
+    else:
+        crop_t, tgt_label = crop, "same system"
     line = f"Source: f/{f_number:g}"
     if focal:
         line += f", {focal:g}mm (about {focal * crop:.0f}mm full-frame equivalent)"
@@ -290,12 +300,14 @@ def main():
 
     for name in args.lenses:
         n = LENSES[name]
-        if n >= n_eff:
-            print(f"Skipping {name} f/{n:g}: the photo is already at or beyond that look.")
+        n_t_eff = n * crop_t  # full-frame-equivalent f-number of the target look
+        if n_t_eff >= n_eff:
+            print(f"Skipping {name} f/{n:g} ({tgt_label}): the photo is already at or beyond that look.")
             continue
-        print(f"Rendering {name} f/{n:g} ...")
-        out_lin = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r)
-        path = out_dir / f"{src.stem}_{name}-f{n:g}.jpg"
+        print(f"Rendering {name} f/{n:g} on {tgt_label} (full-frame equivalent f/{n_t_eff:.2f}) ...")
+        out_lin = render(lin, disp, d_focus, n_t_eff, n_eff, k_px, args.bins, args.bloom, max_r)
+        suffix = "" if (args.target_sensor == "same" and not args.target_crop) else f"_{args.target_sensor if not args.target_crop else 'crop' + str(args.target_crop)}"
+        path = out_dir / f"{src.stem}_{name}-f{n:g}{suffix}.jpg"
         save_image(path, lin_to_srgb(out_lin), exif, icc)
         print(f"  saved {path}")
 
