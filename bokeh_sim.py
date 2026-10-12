@@ -176,6 +176,20 @@ def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r):
 
 
 # --------------------------------------------------------------------------
+# EXIF
+# --------------------------------------------------------------------------
+def read_exif_lens(path):
+    """Return (f_number, focal_mm, focal_35mm_equiv); any may be None."""
+    try:
+        ex = Image.open(path).getexif()
+        ifd = ex.get_ifd(0x8769)
+        get = lambda k: float(ifd[k]) if ifd.get(k) else None
+        return get(0x829D), get(0x920A), get(0xA405)
+    except Exception:
+        return None, None, None
+
+
+# --------------------------------------------------------------------------
 # I/O
 # --------------------------------------------------------------------------
 def load_image(path):
@@ -216,10 +230,13 @@ def save_image(path, srgb, maxv, exif, icc):
 def main():
     ap = argparse.ArgumentParser(description="Re-render a photo as Summicron / Summilux / Noctilux on full frame.")
     ap.add_argument("input")
-    ap.add_argument("--sensor", choices=list(SENSOR_CROP), default="apsc",
-                    help="sensor the photo was shot on (default: apsc)")
+    ap.add_argument("--source-f", type=float, default=None,
+                    help="aperture the photo was shot at (default: read from EXIF)")
+    ap.add_argument("--focal-length", type=float, default=None,
+                    help="actual focal length in mm (default: read from EXIF)")
+    ap.add_argument("--sensor", choices=list(SENSOR_CROP), default=None,
+                    help="sensor type (default: worked out from EXIF)")
     ap.add_argument("--crop", type=float, default=None, help="custom crop factor, overrides --sensor")
-    ap.add_argument("--source-f", type=float, default=2.0, help="aperture the photo was shot at (2 or 2.8)")
     ap.add_argument("--lenses", nargs="+", choices=list(LENSES), default=list(LENSES))
     ap.add_argument("--focus", default=None, help="focus point as fractions, e.g. 0.50,0.24")
     ap.add_argument("--out-dir", default=None, help="default: next to the input file")
@@ -242,10 +259,32 @@ def main():
     long_side = max(h, w)
     rgb8 = (srgb * 255 + 0.5).astype(np.uint8)
 
-    crop = args.crop if args.crop else SENSOR_CROP[args.sensor]
-    n_eff = args.source_f * crop
-    print(f"Source: f/{args.source_f:g} on {args.sensor if not args.crop else f'{crop}x crop'} "
-          f"= full-frame equivalent f/{n_eff:.2f}")
+    ex_f, ex_focal, ex_f35 = read_exif_lens(src)
+    f_number = args.source_f or ex_f
+    focal = args.focal_length or ex_focal
+    if args.crop:
+        crop = args.crop
+    elif args.sensor:
+        crop = SENSOR_CROP[args.sensor]
+    elif ex_f35 and ex_focal:
+        crop = ex_f35 / ex_focal
+    else:
+        crop = None
+
+    missing = []
+    if not f_number:
+        missing.append("aperture (--source-f 2)")
+    if not crop:
+        missing.append("sensor type (--sensor apsc | m43 | ff)")
+    if missing:
+        raise SystemExit("No EXIF found, please provide: " + " and ".join(missing))
+
+    n_eff = f_number * crop
+    line = f"Source: f/{f_number:g}"
+    if focal:
+        line += f", {focal:g}mm (about {focal * crop:.0f}mm full-frame equivalent)"
+    line += f", {crop:.2f}x crop -> full-frame equivalent f/{n_eff:.2f}"
+    print(line)
 
     print("Estimating depth...")
     disp = estimate_disparity(Image.fromarray(rgb8), args.model)
