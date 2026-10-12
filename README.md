@@ -10,6 +10,14 @@ Run `python bokeh_sim.py --help` for all options. `python bokeh_sim.py --version
 
 Versions are git tags (`git tag`); experimental work lives on branches.
 
+## Changelog
+
+- **v0.1.1**: blur strength now scales with full-frame-equivalent focal length (`--strength` applies at
+  35mm-equivalent; a 150mm-equivalent shot gets about 4x). Fixes backgrounds that stayed too sharp on
+  telephoto shots. `--no-focal-scale` turns it off.
+- **v0.1.0**: baseline (depth, eye focus, focus zone, grain, whisker mask v1).
+- Branch `whisker-fix`: unfinished experiment on keeping whiskers; not recommended yet.
+
 ## Licences
 
 This code is licensed under the GNU Affero General Public License, version 3 only (AGPL-3.0-only). See the [LICENSE](LICENSE) file.

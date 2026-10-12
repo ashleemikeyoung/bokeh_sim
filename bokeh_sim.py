@@ -52,9 +52,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 LENSES = {"summicron": 2.0, "summilux": 1.4, "noctilux": 0.95}
 SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0}
+REF_FOCAL_EQ = 35.0  # --strength is calibrated at this full-frame-equivalent focal length (mm)
 GRAIN_SIGMA = 0.3  # fineness of synthetic grain, matched to Fuji X-series JPEG grain
 
 
@@ -401,6 +402,8 @@ def main():
                     help="re-add sensor grain to blurred areas to match the original (0 = off)")
     ap.add_argument("--detail", type=float, default=1.0,
                     help="keep whiskers and other hair-thin detail sharp near the subject (0 = off)")
+    ap.add_argument("--no-focal-scale", action="store_true",
+                    help="do not scale blur strength with focal length")
     ap.add_argument("--no-refine", action="store_true", help="skip depth edge refinement")
     ap.add_argument("--out-dir", default=None, help="default: next to the input file")
     ap.add_argument("--strength", type=float, default=0.04,
@@ -485,8 +488,16 @@ def main():
         keep = np.clip(fine_detail_mask(srgb, disp, d_focus, args.focus_zone) * args.detail, 0, 1)
 
     lin = srgb_to_lin(srgb).astype(np.float32)
-    k_px = args.strength * long_side
-    max_r = 0.06 * long_side
+    # Background blur grows with focal length at the same framing (CoC ~ f_eq / N), so --strength
+    # applies at REF_FOCAL_EQ (about the 35mm-equivalent of the cat photos) and scales from there.
+    f_eq = focal * crop if focal else None
+    focal_scale = float(np.clip(f_eq / REF_FOCAL_EQ, 0.5, 6.0)) if (f_eq and not args.no_focal_scale) else 1.0
+    if f_eq and not args.no_focal_scale:
+        print(f"Blur scale: {f_eq:.0f}mm full-frame equivalent -> {focal_scale:.1f}x the {REF_FOCAL_EQ:.0f}mm-equivalent strength")
+    elif not f_eq:
+        print("Note: focal length unknown (no EXIF), so blur strength is not scaled for it. Add --focal-length.")
+    k_px = args.strength * long_side * focal_scale
+    max_r = min(0.06 * long_side * max(1.0, focal_scale), 0.2 * long_side)
 
     for name in args.lenses:
         n = LENSES[name]
