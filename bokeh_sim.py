@@ -123,6 +123,17 @@ def disc_kernel(r):
     return k / k.sum()
 
 
+def disc_blur(stack, r, max_direct=9.0):
+    """Disc blur; big radii are done at reduced resolution for speed."""
+    if r <= max_direct:
+        return cv2.filter2D(stack, -1, disc_kernel(r), borderType=cv2.BORDER_REFLECT)
+    s = r / 8.0
+    h, w = stack.shape[:2]
+    small = cv2.resize(stack, (max(1, round(w / s)), max(1, round(h / s))), interpolation=cv2.INTER_AREA)
+    small = cv2.filter2D(small, -1, disc_kernel(8.0), borderType=cv2.BORDER_REFLECT)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
 # --------------------------------------------------------------------------
 # Render one aperture
 # --------------------------------------------------------------------------
@@ -152,7 +163,7 @@ def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r):
         r = min(abs(c - d_focus) * scale, max_r)
         stack = np.dstack([src * m[..., None], m])
         if r >= 0.5:
-            stack = cv2.filter2D(stack, -1, disc_kernel(r), borderType=cv2.BORDER_REFLECT)
+            stack = disc_blur(stack, r)
         C, A = stack[..., :3], stack[..., 3:4]
         if acc_c is None:
             acc_c, acc_a = C, A
