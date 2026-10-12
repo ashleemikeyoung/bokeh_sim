@@ -17,30 +17,30 @@
 """
 bokeh_sim.py
 
-Simulate wider apertures (f/0.95, 1.0, 1.2, 1.4, 1.8, 2.0) on a finished JPEG,
-using Depth Anything V2 for depth. No manual masking.
-
-Setup (Apple Silicon Mac):
-    python3 -m venv da2 && source da2/bin/activate
-    pip install torch torchvision transformers pillow opencv-python numpy
+Re-render a finished photo (shot at f/2 or f/2.8) as it would look on a
+full-frame Summicron f/2, Summilux f/1.4 and Noctilux f/0.95, using
+Depth Anything V2 for depth. No manual masking.
 
 Usage:
-    python bokeh_sim.py photo.jpg
-    python bokeh_sim.py photo.jpg --source-f 2.0 --focus 0.50,0.24
-    python bokeh_sim.py photo.jpg --apertures 0.95 1.4 --bloom 3 --save-depth
+    python bokeh_sim.py photo.jpg                       # APS-C, shot at f/2
+    python bokeh_sim.py photo.jpg --sensor m43 --source-f 2.8
+    python bokeh_sim.py photo.jpg --sensor ff --lenses summilux
+    python bokeh_sim.py photo.tif                       # 16-bit TIFF in, 16-bit TIFF out
+    python bokeh_sim.py photo.jpg --focus 0.50,0.24     # pin focus (fractions of width,height)
 
-How it works:
-  1. Depth Anything V2 gives relative disparity (bigger = closer).
-  2. The focus plane is found automatically (sharpest region of the photo),
-     or you can pin it with --focus x,y as fractions of width/height.
-  3. Real blur size scales with 1/f-number and with the disparity difference
-     from the focus plane. The source photo already carries blur from its own
-     aperture, so only the *extra* blur is added (blurs combine in quadrature).
-     Simulating the source aperture itself returns the original.
-  4. The image is split into depth layers, each layer is disc-blurred on its
-     own (premultiplied, so sharp subject colour does not bleed into the
-     background), then composited back to front. Blur is done in linear light
-     with optional highlight bloom so bright points become proper bokeh discs.
+Sensor equivalence:
+    Depth of field depends on sensor size, so the photo's existing blur is
+    treated as that of a full-frame lens at (source f-number x crop factor):
+    APS-C 1.5x, M43 2x, FF 1x. Only the extra blur needed to reach each
+    target aperture is added (blurs combine in quadrature). A look the photo
+    already meets or exceeds is skipped, since blur cannot be removed.
+    Assumes the full-frame version is framed identically (e.g. 23mm APS-C
+    versus 35mm FF at the same distance).
+
+How the blur works:
+    Layered disc blur by depth, premultiplied so the sharp subject does not
+    bleed into the background, composited back to front in linear light with
+    optional highlight bloom for bokeh discs.
 """
 import os
 
@@ -53,7 +53,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
-DEFAULT_APERTURES = [0.95, 1.0, 1.2, 1.4, 1.8, 2.0]
+LENSES = {"summicron": 2.0, "summilux": 1.4, "noctilux": 0.95}
+SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0}
 
 
 # --------------------------------------------------------------------------
@@ -175,37 +176,79 @@ def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r):
 
 
 # --------------------------------------------------------------------------
+# I/O
+# --------------------------------------------------------------------------
+def load_image(path):
+    """Return (srgb float32 0-1, max code value, exif, icc)."""
+    if path.suffix.lower() in (".tif", ".tiff"):
+        im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if im is None:
+            raise SystemExit(f"Could not read {path}")
+        if im.dtype not in (np.uint8, np.uint16):
+            raise SystemExit("TIFF must be 8-bit or 16-bit integer.")
+        if im.ndim == 2:
+            im = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
+        im = np.ascontiguousarray(im[..., :3][..., ::-1])  # drop alpha, BGR -> RGB
+        maxv = 65535 if im.dtype == np.uint16 else 255
+        return im.astype(np.float32) / maxv, maxv, None, None
+    pil = Image.open(path)
+    exif, icc = pil.info.get("exif"), pil.info.get("icc_profile")
+    return np.array(pil.convert("RGB")).astype(np.float32) / 255.0, 255, exif, icc
+
+
+def save_image(path, srgb, maxv, exif, icc):
+    arr = np.clip(srgb * maxv + 0.5, 0, maxv)
+    if path.suffix.lower() in (".tif", ".tiff"):
+        arr = arr.astype(np.uint16 if maxv == 65535 else np.uint8)
+        cv2.imwrite(str(path), np.ascontiguousarray(arr[..., ::-1]))
+    else:
+        kw = {"quality": 95, "subsampling": 0}
+        if exif:
+            kw["exif"] = exif
+        if icc:
+            kw["icc_profile"] = icc
+        Image.fromarray(arr.astype(np.uint8)).save(path, **kw)
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Simulate wider apertures with Depth Anything V2.")
+    ap = argparse.ArgumentParser(description="Re-render a photo as Summicron / Summilux / Noctilux on full frame.")
     ap.add_argument("input")
-    ap.add_argument("--out-dir", default=None, help="default: next to the input file")
-    ap.add_argument("--apertures", type=float, nargs="+", default=DEFAULT_APERTURES)
-    ap.add_argument("--source-f", type=float, default=2.0, help="aperture the photo was shot at")
+    ap.add_argument("--sensor", choices=list(SENSOR_CROP), default="apsc",
+                    help="sensor the photo was shot on (default: apsc)")
+    ap.add_argument("--crop", type=float, default=None, help="custom crop factor, overrides --sensor")
+    ap.add_argument("--source-f", type=float, default=2.0, help="aperture the photo was shot at (2 or 2.8)")
+    ap.add_argument("--lenses", nargs="+", choices=list(LENSES), default=list(LENSES))
     ap.add_argument("--focus", default=None, help="focus point as fractions, e.g. 0.50,0.24")
+    ap.add_argument("--out-dir", default=None, help="default: next to the input file")
     ap.add_argument("--strength", type=float, default=0.04,
                     help="blur radius at f/1 for the full depth range, as a fraction of the long side")
     ap.add_argument("--bins", type=int, default=32, help="depth layers (lower = faster)")
     ap.add_argument("--bloom", type=float, default=2.0, help="highlight bokeh boost, 0 to disable")
     ap.add_argument("--model", default="depth-anything/Depth-Anything-V2-Large-hf",
-                    help="use ...-Small-hf for a faster, Apache-2.0 model")
+                    help="use ...-Small-hf for a faster model")
     ap.add_argument("--save-depth", action="store_true", help="also save the depth map PNG")
     args = ap.parse_args()
 
     src = Path(args.input)
     out_dir = Path(args.out_dir) if args.out_dir else src.parent
     out_dir.mkdir(parents=True, exist_ok=True)
+    ext = ".tif" if src.suffix.lower() in (".tif", ".tiff") else ".jpg"
 
-    img = Image.open(src).convert("RGB")
-    exif = Image.open(src).info.get("exif")
-    icc = Image.open(src).info.get("icc_profile")
-    rgb8 = np.array(img)
-    h, w = rgb8.shape[:2]
+    srgb, maxv, exif, icc = load_image(src)
+    h, w = srgb.shape[:2]
     long_side = max(h, w)
+    rgb8 = (srgb * 255 + 0.5).astype(np.uint8)
+
+    crop = args.crop if args.crop else SENSOR_CROP[args.sensor]
+    n_eff = args.source_f * crop
+    print(f"Source: f/{args.source_f:g} on {args.sensor if not args.crop else f'{crop}x crop'} "
+          f"= full-frame equivalent f/{n_eff:.2f}")
 
     print("Estimating depth...")
-    disp = estimate_disparity(img, args.model)
+    disp = estimate_disparity(Image.fromarray(rgb8), args.model)
     if args.save_depth:
         Image.fromarray((disp * 255).astype(np.uint8)).save(out_dir / f"{src.stem}_depth.png")
 
@@ -217,21 +260,19 @@ def main():
         d_focus = auto_focus(rgb8, disp)
         print(f"Focus plane (auto): {d_focus:.3f}")
 
-    lin = srgb_to_lin(rgb8.astype(np.float32) / 255.0).astype(np.float32)
+    lin = srgb_to_lin(srgb).astype(np.float32)
     k_px = args.strength * long_side
     max_r = 0.06 * long_side
 
-    for n in args.apertures:
-        print(f"Rendering f/{n:g} ...")
-        out_lin = render(lin, disp, d_focus, n, args.source_f, k_px, args.bins, args.bloom, max_r)
-        out8 = (lin_to_srgb(out_lin) * 255 + 0.5).astype(np.uint8)
-        path = out_dir / f"{src.stem}_f{n:g}.jpg"
-        kw = {"quality": 95, "subsampling": 0}
-        if exif:
-            kw["exif"] = exif
-        if icc:
-            kw["icc_profile"] = icc
-        Image.fromarray(out8).save(path, **kw)
+    for name in args.lenses:
+        n = LENSES[name]
+        if n >= n_eff:
+            print(f"Skipping {name} f/{n:g}: the photo is already at or beyond that look.")
+            continue
+        print(f"Rendering {name} f/{n:g} ...")
+        out_lin = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r)
+        path = out_dir / f"{src.stem}_{name}-f{n:g}{ext}"
+        save_image(path, lin_to_srgb(out_lin), maxv, exif, icc)
         print(f"  saved {path}")
 
 
