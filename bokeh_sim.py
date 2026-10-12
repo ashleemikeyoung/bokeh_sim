@@ -52,24 +52,29 @@ import cv2
 import numpy as np
 from PIL import Image
 
+__version__ = "0.1.0"
 LENSES = {"summicron": 2.0, "summilux": 1.4, "noctilux": 0.95}
 SENSOR_CROP = {"ff": 1.0, "apsc": 1.5, "m43": 2.0}
+GRAIN_SIGMA = 0.3  # fineness of synthetic grain, matched to Fuji X-series JPEG grain
 
 
 # --------------------------------------------------------------------------
 # Depth
 # --------------------------------------------------------------------------
-def estimate_disparity(img, model_id):
+def estimate_disparity(img, model_id, force_cpu=False):
     import torch
     from transformers import pipeline
 
-    if torch.backends.mps.is_available():
+    if force_cpu:
+        device = torch.device("cpu")
+    elif torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
 
+    print(f"Depth model device: {device.type}")
     pipe = pipeline("depth-estimation", model=model_id, device=device)
     out = pipe(img)
     d = out["predicted_depth"].squeeze().float().cpu().numpy()
@@ -77,6 +82,82 @@ def estimate_disparity(img, model_id):
     d = cv2.resize(d, (w, h), interpolation=cv2.INTER_CUBIC)
     lo, hi = np.percentile(d, [1, 99])
     return np.clip((d - lo) / (hi - lo + 1e-6), 0, 1).astype(np.float32)
+
+
+# --------------------------------------------------------------------------
+# Depth refinement + eye focus
+# --------------------------------------------------------------------------
+def refine_depth(rgb8, disp):
+    """Snap the (coarse) depth edges to real image edges with a guided filter."""
+    h, w = disp.shape
+    r = max(4, int(0.006 * max(h, w)))
+    k = (2 * r + 1, 2 * r + 1)
+    box = lambda x: cv2.boxFilter(x, -1, k, borderType=cv2.BORDER_REFLECT)
+    guide = cv2.GaussianBlur(cv2.cvtColor(rgb8, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0, (0, 0), 1.0)
+    mi, mp = box(guide), box(disp)
+    cov = box(guide * disp) - mi * mp
+    var = box(guide * guide) - mi * mi
+    a = cov / (var + 1e-3)
+    b = mp - a * mi
+    return np.clip(box(a) * guide + box(b), 0, 1).astype(np.float32)
+
+
+class EyeDetectionUnavailable(Exception):
+    pass
+
+
+def detect_eye_focus(rgb8, disp):
+    """Find a cat or human face, take depth at the nearer eye. Returns (disparity, label) or None."""
+    if not hasattr(cv2, "CascadeClassifier") or not hasattr(getattr(cv2, "data", None), "haarcascades"):
+        raise EyeDetectionUnavailable
+    g = cv2.cvtColor(rgb8, cv2.COLOR_RGB2GRAY)
+    h, w = g.shape
+    min_sz = int(0.08 * max(h, w))
+    d = cv2.data.haarcascades
+    for xml, label, eyes in (
+        ("haarcascade_frontalcatface_extended.xml", "cat", ((0.28, 0.40), (0.72, 0.40))),
+        ("haarcascade_frontalface_default.xml", "face", ((0.30, 0.38), (0.70, 0.38))),
+    ):
+        det = cv2.CascadeClassifier(d + xml)
+        if det.empty():
+            continue
+        faces = det.detectMultiScale(g, 1.05, 6, minSize=(min_sz, min_sz))
+        if len(faces):
+            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            r = max(3, int(0.03 * fw))
+            vals = []
+            for ex, ey in eyes:
+                cx, cy = int(x + ex * fw), int(y + ey * fh)
+                patch = disp[max(0, cy - r): cy + r, max(0, cx - r): cx + r]
+                vals.append(float(np.median(patch)))
+            return max(vals), label  # nearer eye wins
+    return None
+
+
+def pick_focus(rgb8):
+    """Show the photo; click the eye (or anything to keep sharp), then press any key."""
+    h, w = rgb8.shape[:2]
+    sc = min(1.0, 1400 / max(h, w))
+    view = cv2.resize(np.ascontiguousarray(rgb8[..., ::-1]), (int(w * sc), int(h * sc)))
+    pt = {}
+
+    def on_click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            pt["xy"] = (x / view.shape[1], y / view.shape[0])
+
+    title = "Click the eye, then press any key"
+    cv2.namedWindow(title)
+    cv2.setMouseCallback(title, on_click)
+    while True:
+        shown = view.copy()
+        if "xy" in pt:
+            cx, cy = int(pt["xy"][0] * view.shape[1]), int(pt["xy"][1] * view.shape[0])
+            cv2.circle(shown, (cx, cy), 12, (0, 255, 0), 2)
+        cv2.imshow(title, shown)
+        if cv2.waitKey(30) != -1 and "xy" in pt:
+            break
+    cv2.destroyAllWindows()
+    return pt["xy"]
 
 
 # --------------------------------------------------------------------------
@@ -137,25 +218,35 @@ def disc_blur(stack, r, max_direct=9.0):
 # --------------------------------------------------------------------------
 # Render one aperture
 # --------------------------------------------------------------------------
-def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r):
+def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r, zone=0.0):
     gain = np.sqrt(max(0.0, 1 / n_target**2 - 1 / n_source**2))
     if gain == 0:
-        return lin
+        return lin, np.zeros(lin.shape[:2], np.float32)
 
     scale = k_px * gain  # blur radius in px for a disparity gap of 1.0
 
-    # Highlight bloom: boost bright pixels that are going to be blurred.
+    # In-focus zone: everything within +/- zone of the focus plane stays perfectly
+    # sharp (this is what keeps the whole face, not just one slice of it, crisp).
+    delta = disp - d_focus
+    disp = d_focus + np.sign(delta) * np.maximum(np.abs(delta) - zone, 0)
+
+    # Highlight bloom: only true bright points (specular highlights), not white fur.
     lum = lin @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-    hl = np.clip((lum - 0.6) / 0.4, 0, 1)
+    hl = np.clip((lum - 0.85) / 0.15, 0, 1)
     hl = hl * hl * (3 - 2 * hl)
-    ramp = np.clip(np.abs(disp - d_focus) * scale / 4.0, 0, 1)
+    r_map = np.minimum(np.abs(disp - d_focus) * scale, max_r).astype(np.float32)
+    ramp = np.clip(r_map / 4.0, 0, 1)
     src = lin * (1 + bloom * hl * ramp)[..., None]
 
+    # Depth layers whose centres line up exactly with the focus plane, so
+    # in-focus pixels land on a layer with zero blur and are left untouched.
     step = 1.0 / bins
-    centers = (np.arange(bins) + 0.5) * step
+    k_lo = int(np.floor((0 - d_focus) / step))
+    k_hi = int(np.ceil((1 - d_focus) / step))
+    centers = d_focus + step * np.arange(k_lo, k_hi + 1)
+
     acc_c = None
     acc_a = None
-
     for c in centers:  # far (low disparity) to near
         m = np.clip(1 - np.abs(disp - c) / step, 0, 1).astype(np.float32)
         if m.max() < 1e-3:
@@ -171,7 +262,84 @@ def render(lin, disp, d_focus, n_target, n_source, k_px, bins, bloom, max_r):
             acc_c = C + (1 - A) * acc_c
             acc_a = A + (1 - A) * acc_a
 
-    return acc_c / np.maximum(acc_a, 1e-6)
+    return acc_c / np.maximum(acc_a, 1e-6), r_map
+
+
+# --------------------------------------------------------------------------
+# Grain
+# --------------------------------------------------------------------------
+def _noise_level(g):
+    """Rough sensor-noise estimate: quietest quarter of 64px tiles, robust MAD of the high-pass."""
+    res = g - cv2.GaussianBlur(g, (0, 0), 1.0)
+    t = 64
+    h, w = res.shape
+    h2, w2 = h // t * t, w // t * t
+    tiles = np.abs(res[:h2, :w2]).reshape(h2 // t, t, w2 // t, t).transpose(0, 2, 1, 3).reshape(-1, t * t)
+    return float(np.percentile(1.4826 * np.median(tiles, axis=1), 25))
+
+
+def add_grain(out_srgb, orig_srgb, r_map, strength=1.0):
+    """Blur averages sensor grain away; put matching grain back where blur was applied."""
+    gray = cv2.cvtColor(orig_srgb.astype(np.float32), cv2.COLOR_RGB2GRAY)
+    rng = np.random.default_rng(0)
+    unit = cv2.GaussianBlur(rng.standard_normal(gray.shape).astype(np.float32), (0, 0), GRAIN_SIGMA)
+    unit /= unit.std()
+    amp = _noise_level(gray) / max(_noise_level(unit), 1e-8)
+    w = np.clip(r_map / 2.0, 0, 1)
+    return out_srgb + (strength * amp * w * unit)[..., None]
+
+
+# --------------------------------------------------------------------------
+# Fine-detail protection (whiskers, single hairs)
+# --------------------------------------------------------------------------
+def _line_kernel(theta, off, sx, sy, n):
+    r = np.arange(-n, n + 1, dtype=np.float32)
+    X, Y = np.meshgrid(r, r)
+    u = X * np.cos(theta) + Y * np.sin(theta)            # along the line
+    v = -X * np.sin(theta) + Y * np.cos(theta) - off     # across the line
+    k = np.exp(-(u**2) / (2 * sx**2) - (v**2) / (2 * sy**2))
+    return (k / k.sum()).astype(np.float32)
+
+
+def line_response(L, angles=12, sx=5.0, sy=0.9, side=2.8):
+    """Thin bright OR dark lines. The line centre must beat BOTH sides, so plain edges score ~0."""
+    n = int(np.ceil(3 * sx))
+    best = np.zeros_like(L)
+    for i in range(angles):
+        th = np.pi * i / angles
+        c = cv2.filter2D(L, -1, _line_kernel(th, 0, sx, sy, n), borderType=cv2.BORDER_REFLECT)
+        a = cv2.filter2D(L, -1, _line_kernel(th, +side, sx, sy, n), borderType=cv2.BORDER_REFLECT)
+        b = cv2.filter2D(L, -1, _line_kernel(th, -side, sx, sy, n), borderType=cv2.BORDER_REFLECT)
+        best = np.maximum(best, np.maximum(np.minimum(c - a, c - b), np.minimum(a - c, b - c)))
+    return np.maximum(best, 0)
+
+
+def fine_detail_mask(srgb, disp, d_focus, zone, reach=0.14):
+    """
+    Depth maps cannot see whiskers (1-3 px wide), so they get blurred away as background.
+    Find crisp thin lines in the original and return how strongly to restore them (0..1),
+    fading out with distance from the in-focus subject.
+    """
+    h, w = disp.shape
+    long_side = max(h, w)
+    L = cv2.cvtColor(srgb.astype(np.float32), cv2.COLOR_RGB2GRAY)
+
+    # threshold calibrated on synthetic grain with the same strength as the photo's
+    amp = _noise_level(L)
+    rng = np.random.default_rng(1)
+    u = cv2.GaussianBlur(rng.standard_normal((640, 640)).astype(np.float32), (0, 0), GRAIN_SIGMA)
+    u /= u.std()
+    thr = float(np.percentile(line_response(0.5 + amp * u / max(_noise_level(u), 1e-8)), 99.7))
+
+    R = line_response(L)
+    a = np.clip((R - thr) / max(thr, 1e-6), 0, 1)
+    a = cv2.GaussianBlur(cv2.dilate(a, np.ones((3, 3), np.uint8)), (0, 0), 0.7)
+
+    # only near the in-focus subject
+    near = (np.abs(disp - d_focus) <= zone).astype(np.uint8)
+    dist = cv2.distanceTransform(1 - near, cv2.DIST_L2, 5)
+    gate = np.clip((1 - dist / (reach * long_side)) * 1.6, 0, 1)  # full strength for the first third, then fade
+    return (a * gate).astype(np.float32)
 
 
 # --------------------------------------------------------------------------
@@ -215,6 +383,7 @@ def save_image(path, srgb, exif, icc):
 # --------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Re-render a photo as Summicron / Summilux / Noctilux on full frame.")
+    ap.add_argument("--version", action="version", version=f"bokeh_sim {__version__}")
     ap.add_argument("input")
     ap.add_argument("--source-f", type=float, default=None,
                     help="aperture the photo was shot at (default: read from EXIF)")
@@ -225,13 +394,22 @@ def main():
     ap.add_argument("--crop", type=float, default=None, help="custom crop factor, overrides --sensor")
     ap.add_argument("--lenses", nargs="+", choices=list(LENSES), default=list(LENSES))
     ap.add_argument("--focus", default=None, help="focus point as fractions, e.g. 0.50,0.24")
+    ap.add_argument("--pick", action="store_true", help="click the focus point (the eye) on the photo")
+    ap.add_argument("--focus-zone", type=float, default=0.08,
+                    help="depth band around the eye that stays fully sharp (bigger = more of the face sharp)")
+    ap.add_argument("--grain", type=float, default=1.0,
+                    help="re-add sensor grain to blurred areas to match the original (0 = off)")
+    ap.add_argument("--detail", type=float, default=1.0,
+                    help="keep whiskers and other hair-thin detail sharp near the subject (0 = off)")
+    ap.add_argument("--no-refine", action="store_true", help="skip depth edge refinement")
     ap.add_argument("--out-dir", default=None, help="default: next to the input file")
     ap.add_argument("--strength", type=float, default=0.04,
                     help="blur radius at f/1 for the full depth range, as a fraction of the long side")
     ap.add_argument("--bins", type=int, default=32, help="depth layers (lower = faster)")
-    ap.add_argument("--bloom", type=float, default=2.0, help="highlight bokeh boost, 0 to disable")
+    ap.add_argument("--bloom", type=float, default=1.0, help="highlight bokeh boost, 0 to disable")
     ap.add_argument("--model", default="depth-anything/Depth-Anything-V2-Large-hf",
                     help="use ...-Small-hf for a faster model")
+    ap.add_argument("--cpu", action="store_true", help="run the depth model on the CPU only")
     ap.add_argument("--save-depth", action="store_true", help="also save the depth map PNG")
     args = ap.parse_args()
 
@@ -272,17 +450,39 @@ def main():
     print(line)
 
     print("Estimating depth...")
-    disp = estimate_disparity(Image.fromarray(rgb8), args.model)
+    disp = estimate_disparity(Image.fromarray(rgb8), args.model, args.cpu)
     if args.save_depth:
         Image.fromarray((disp * 255).astype(np.uint8)).save(out_dir / f"{src.stem}_depth.png")
+
+    if not args.no_refine:
+        disp = refine_depth(rgb8, disp)
 
     if args.focus:
         fx, fy = (float(v) for v in args.focus.split(","))
         d_focus = focus_from_point(disp, fx, fy)
         print(f"Focus plane from point ({fx}, {fy}): {d_focus:.3f}")
+    elif args.pick:
+        fx, fy = pick_focus(rgb8)
+        d_focus = focus_from_point(disp, fx, fy)
+        print(f"Focus plane from click ({fx:.2f}, {fy:.2f}): {d_focus:.3f}")
     else:
-        d_focus = auto_focus(rgb8, disp)
-        print(f"Focus plane (auto): {d_focus:.3f}")
+        try:
+            found = detect_eye_focus(rgb8, disp)
+        except EyeDetectionUnavailable:
+            found = None
+            print(f"Note: this OpenCV build (v{cv2.__version__}) has no face detector, so eye detection is off. "
+                  "Use --pick or --focus x,y to aim at the eye.")
+        if found:
+            d_focus, label = found
+            print(f"Eye focus: {label} face found, focusing on the nearer eye ({d_focus:.3f})")
+        else:
+            d_focus = auto_focus(rgb8, disp)
+            print(f"No face found, focus plane (auto): {d_focus:.3f}")
+
+    keep = None
+    if args.detail > 0:
+        print("Finding whiskers and fine detail...")
+        keep = np.clip(fine_detail_mask(srgb, disp, d_focus, args.focus_zone) * args.detail, 0, 1)
 
     lin = srgb_to_lin(srgb).astype(np.float32)
     k_px = args.strength * long_side
@@ -294,9 +494,15 @@ def main():
             print(f"Skipping {name} f/{n:g}: the photo is already at or beyond that look.")
             continue
         print(f"Rendering {name} f/{n:g} ...")
-        out_lin = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r)
+        out_lin, r_map = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r, args.focus_zone)
+        if keep is not None:
+            out_lin = out_lin * (1 - keep[..., None]) + lin * keep[..., None]
+            r_map = r_map * (1 - keep)
+        out_srgb = lin_to_srgb(out_lin)
+        if args.grain > 0:
+            out_srgb = add_grain(out_srgb, srgb, r_map, args.grain)
         path = out_dir / f"{src.stem}_{name}-f{n:g}.jpg"
-        save_image(path, lin_to_srgb(out_lin), exif, icc)
+        save_image(path, out_srgb, exif, icc)
         print(f"  saved {path}")
 
 
