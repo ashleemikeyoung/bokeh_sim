@@ -25,7 +25,6 @@ Usage:
     python bokeh_sim.py photo.jpg                       # APS-C, shot at f/2
     python bokeh_sim.py photo.jpg --sensor m43 --source-f 2.8
     python bokeh_sim.py photo.jpg --sensor ff --lenses summilux
-    python bokeh_sim.py photo.tif                       # 16-bit TIFF in, 16-bit TIFF out
     python bokeh_sim.py photo.jpg --focus 0.50,0.24     # pin focus (fractions of width,height)
 
 Sensor equivalence:
@@ -193,35 +192,22 @@ def read_exif_lens(path):
 # I/O
 # --------------------------------------------------------------------------
 def load_image(path):
-    """Return (srgb float32 0-1, max code value, exif, icc)."""
+    """Return (srgb float32 0-1, exif, icc). JPEG/PNG only."""
     if path.suffix.lower() in (".tif", ".tiff"):
-        im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-        if im is None:
-            raise SystemExit(f"Could not read {path}")
-        if im.dtype not in (np.uint8, np.uint16):
-            raise SystemExit("TIFF must be 8-bit or 16-bit integer.")
-        if im.ndim == 2:
-            im = cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
-        im = np.ascontiguousarray(im[..., :3][..., ::-1])  # drop alpha, BGR -> RGB
-        maxv = 65535 if im.dtype == np.uint16 else 255
-        return im.astype(np.float32) / maxv, maxv, None, None
+        raise SystemExit("TIFF is not supported. Export a JPEG (sRGB) from your editor and use that.")
     pil = Image.open(path)
     exif, icc = pil.info.get("exif"), pil.info.get("icc_profile")
-    return np.array(pil.convert("RGB")).astype(np.float32) / 255.0, 255, exif, icc
+    return np.array(pil.convert("RGB")).astype(np.float32) / 255.0, exif, icc
 
 
-def save_image(path, srgb, maxv, exif, icc):
-    arr = np.clip(srgb * maxv + 0.5, 0, maxv)
-    if path.suffix.lower() in (".tif", ".tiff"):
-        arr = arr.astype(np.uint16 if maxv == 65535 else np.uint8)
-        cv2.imwrite(str(path), np.ascontiguousarray(arr[..., ::-1]))
-    else:
-        kw = {"quality": 95, "subsampling": 0}
-        if exif:
-            kw["exif"] = exif
-        if icc:
-            kw["icc_profile"] = icc
-        Image.fromarray(arr.astype(np.uint8)).save(path, **kw)
+def save_image(path, srgb, exif, icc):
+    arr = np.clip(srgb * 255 + 0.5, 0, 255).astype(np.uint8)
+    kw = {"quality": 95, "subsampling": 0}
+    if exif:
+        kw["exif"] = exif
+    if icc:
+        kw["icc_profile"] = icc
+    Image.fromarray(arr).save(path, **kw)
 
 
 # --------------------------------------------------------------------------
@@ -252,9 +238,8 @@ def main():
     src = Path(args.input)
     out_dir = Path(args.out_dir) if args.out_dir else src.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    ext = ".tif" if src.suffix.lower() in (".tif", ".tiff") else ".jpg"
 
-    srgb, maxv, exif, icc = load_image(src)
+    srgb, exif, icc = load_image(src)
     h, w = srgb.shape[:2]
     long_side = max(h, w)
     rgb8 = (srgb * 255 + 0.5).astype(np.uint8)
@@ -310,8 +295,8 @@ def main():
             continue
         print(f"Rendering {name} f/{n:g} ...")
         out_lin = render(lin, disp, d_focus, n, n_eff, k_px, args.bins, args.bloom, max_r)
-        path = out_dir / f"{src.stem}_{name}-f{n:g}{ext}"
-        save_image(path, lin_to_srgb(out_lin), maxv, exif, icc)
+        path = out_dir / f"{src.stem}_{name}-f{n:g}.jpg"
+        save_image(path, lin_to_srgb(out_lin), exif, icc)
         print(f"  saved {path}")
 
 
