@@ -1,0 +1,11 @@
+# Optional: MoGe-2 depth model (--depth-model moge2).
+# Install with --no-deps, because MoGe's own requirements pull in heavy extras
+# (gradio, a second OpenCV, an NVIDIA-only library) that this project does not need:
+#
+#   python -m pip install --no-deps -r requirements-moge.txt
+#
+# MoGe-3 with PyTorch (--depth-model moge3) needs an NVIDIA GPU and is not covered here.
+# On Apple silicon use --depth-model moge3-mlx instead (requirements-mlx.txt).
+
+git+https://github.com/microsoft/MoGe.git
+git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37

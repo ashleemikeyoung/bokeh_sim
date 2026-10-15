@@ -1,0 +1,10 @@
+# Core dependencies for bokeh_sim.py and compare_depth_models.py
+# Install with:  python -m pip install -r requirements.txt
+# Minimum versions are listed so this works in an existing environment.
+# See requirements-tested.txt for the exact versions this was last run with.
+
+numpy>=1.26
+opencv-python>=4.9
+Pillow>=10.0
+torch>=2.4
+transformers>=4.51   # Depth Anything V2 and Apple Depth Pro (older versions lack Depth Pro)
