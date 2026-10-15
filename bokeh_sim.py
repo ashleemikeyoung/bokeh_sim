@@ -107,6 +107,7 @@ def estimate_metric_depth(img, model_id):
 DEPTH_MODELS = ["da2", "da2-metric", "depthpro", "moge2", "moge3", "moge3-mlx"]
 MOGE_REPOS = {"moge2": "Ruicheng/moge-2-vitl", "moge3": "Ruicheng/moge-3-vitl"}
 MOGE3_MLX_REPO = "mlx-community/moge-3-vitl-mlx-fp32"
+DEFAULT_MOGE2_WEIGHTS = os.path.expanduser("~/models/moge2/model.pt")  # used automatically when it exists
 MOGE_INSTALL = ("python -m pip install --no-deps git+https://github.com/microsoft/MoGe.git "
                 "git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37")
 
@@ -168,7 +169,8 @@ def depth_moge(img, name, fov_x_deg=None, weights=None):
     except ImportError as e:
         extra = ("\nMoGe-3 needs flex-gemm, which is built for NVIDIA GPUs and is unlikely to work on a Mac. "
                  "On a Mac use --depth-model moge3-mlx (or moge2)." if name == "moge3" else "")
-        raise SystemExit(f"MoGe could not be imported ({e}). Install it with:\n  {MOGE_INSTALL}{extra}")
+        raise SystemExit(f"MoGe could not be imported ({e}). Install it with:\n  {MOGE_INSTALL}{extra}\n"
+                         "Or use Depth Anything V2 instead: --depth-model da2-metric")
     import torch
     arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
     source = MOGE_REPOS[name]
@@ -343,23 +345,6 @@ def read_exif_lens(path):
         return None, None, None
 
 
-def guess_sensor_from_camera(path):
-    """Best-effort sensor size from the camera make and model. Returns (key or None, make, model)."""
-    try:
-        ex = Image.open(path).getexif()
-        make = str(ex.get(0x010F) or "").strip()
-        model = str(ex.get(0x0110) or "").strip()
-    except Exception:
-        return None, "", ""
-    import re
-    m = (make + " " + model).upper()
-    if "FUJIFILM" in m:
-        if re.search(r"\b(X-HALF|X10|X20|X30|XQ1|XQ2|X-S1)\b", model.upper()) or "FINEPIX" in m:
-            return None, make, model          # compacts with smaller sensors: do not guess
-        return ("mf" if "GFX" in m else "apsc"), make, model
-    return None, make, model
-
-
 # --------------------------------------------------------------------------
 # I/O
 # --------------------------------------------------------------------------
@@ -408,8 +393,9 @@ def main():
                     help="true-to-optics blur from metric depth, focal length, f-number and sensor size "
                          "(ignores --strength)")
     ap.add_argument("--depth-model", choices=DEPTH_MODELS, default=None,
-                    help="da2 = Depth Anything V2 relative depth (default); with --physical the default is "
-                         "da2-metric. depthpro = Apple Depth Pro, moge2 / moge3 = MoGe (extra install; "
+                    help="da2 = Depth Anything V2 relative depth (the default without --physical); with --physical "
+                         "the default is moge2 and da2-metric is the Depth Anything V2 alternative. "
+                         "depthpro = Apple Depth Pro, moge2 / moge3 = MoGe (extra install; "
                          "moge3 needs an NVIDIA GPU), moge3-mlx = MoGe-3 on Apple silicon via mlx-vlm. "
                          "All but da2 give metric depth.")
     ap.add_argument("--depth-weights", default=None,
@@ -450,11 +436,6 @@ def main():
         crop = ex_f35 / ex_focal
     else:
         crop = None
-    if not crop:
-        key, mk, md = guess_sensor_from_camera(src)
-        if key:
-            crop = SENSOR_CROP[key]
-            print(f"The EXIF has no 35mm-equivalent focal length, so assuming the {mk} {md} is {key} ({crop:g}x crop).")
 
     missing = []
     if not f_number:
@@ -462,7 +443,7 @@ def main():
     if not crop:
         missing.append("sensor type (--sensor apsc | m43 | ff)")
     if missing:
-        raise SystemExit("The photo's EXIF does not include: " + " and ".join(missing) + ". Give them as flags.")
+        raise SystemExit("No EXIF found, please provide: " + " and ".join(missing))
 
     crop_src = SENSOR_CROP[args.assume_sensor] if args.assume_sensor else crop   # system the blur model assumes
     n_eff = f_number * crop_src
@@ -480,10 +461,10 @@ def main():
     if args.assume_sensor:
         print(f"Pretending the photo was shot on {args.assume_sensor} at f/{f_number:g}, same framing")
 
-    dm = args.depth_model or ("da2-metric" if args.physical else "da2")
+    dm = args.depth_model or ("moge2" if args.physical else "da2")
     if args.physical and dm == "da2":
-        dm = "da2-metric"
-        print("--physical needs metric depth, so using da2-metric.")
+        dm = "moge2"
+        print("--physical needs metric depth, so using moge2.")
     use_metric = dm != "da2"
     fov_x = f_true_px = None
     if focal:   # real lens and sensor -> real field of view and focal length in pixels
@@ -499,7 +480,10 @@ def main():
             print("  (metric model used for the depth map only; blur strength still comes from --strength)")
         if args.depth_weights and dm not in MOGE_REPOS:
             print(f"  (--depth-weights only applies to moge2 / moge3, ignored for {dm})")
-        z = metric_depth(dm, Image.fromarray(rgb8), args.metric_model, fov_x, f_true_px, args.depth_weights)
+        weights = args.depth_weights
+        if not weights and dm == "moge2" and os.path.isfile(DEFAULT_MOGE2_WEIGHTS):
+            weights = DEFAULT_MOGE2_WEIGHTS
+        z = metric_depth(dm, Image.fromarray(rgb8), args.metric_model, fov_x, f_true_px, weights)
         inv = 1.0 / z                                     # true disparity, 1/m
         dmax = float(np.percentile(inv, 99.5))
         disp = np.clip(inv / dmax, 0, 1).astype(np.float32)   # normalised 0-1, near = 1
